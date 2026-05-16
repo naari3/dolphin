@@ -169,27 +169,41 @@ static std::array<u32, 8> s_exec2_last_response{};
 
 static CoreTiming::EventType* s_et_test_hw_phase2 = nullptr;
 
-// One snapshot per in-flight non-blocking connect. The full command frame is captured so
-// the poll callback can rebuild the response (token at byte[0], socket low byte at byte[8])
-// regardless of what other AMMB commands ran in between.
-struct AsyncConnect
+// Identifies which AMMB command was deferred so the poll callback knows how to complete it.
+enum class AsyncOpType : u8
 {
+  Connect,
+  Recv,
+  Send,
+  Accept,
+};
+
+// One snapshot per in-flight non-blocking AMMB op. The full command frame is captured so the
+// poll callback can rebuild the response (token at byte[0], socket low byte at byte[8])
+// regardless of what other AMMB commands ran in between. parameter_offset records where
+// op-specific args (data offset, length, ...) live inside saved_media_buffer.
+struct AsyncOp
+{
+  AsyncOpType op_type;
   SOCKET host_socket;
+  u32 parameter_offset;
   std::array<u32, 0xc0> saved_media_buffer;
   std::chrono::steady_clock::time_point deadline;
 };
-static std::map<SOCKET, AsyncConnect> s_async_connects;
-static CoreTiming::EventType* s_et_async_connect_poll = nullptr;
+static std::map<SOCKET, AsyncOp> s_async_ops;
+static CoreTiming::EventType* s_et_async_op_poll = nullptr;
 // Tells the Execute2 dispatcher to skip its default response-save + interrupt; the poll
-// callback fires the interrupt once the host connect() resolves.
-static bool s_connect_deferred = false;
-// Prevents duplicate ScheduleEvent when multiple NetDIMMConnect calls land between firings.
-static bool s_async_connect_poll_scheduled = false;
-static constexpr s64 kAsyncConnectPollIntervalUs = 5000;
+// callback fires the interrupt once the host op resolves.
+static bool s_async_defer_active = false;
+// Prevents duplicate ScheduleEvent when multiple defers land between firings.
+static bool s_async_op_poll_scheduled = false;
+static constexpr s64 kAsyncOpPollIntervalUs = 5000;
 
 static int PlatformPoll(std::span<WSAPOLLFD> pfds, std::chrono::milliseconds timeout);
-static void AsyncConnectPollCallback(Core::System& system, u64 userdata, s64 cycles_late);
-static void ScheduleAsyncConnectPollIfNeeded();
+static void AsyncOpPollCallback(Core::System& system, u64 userdata, s64 cycles_late);
+static void ScheduleAsyncOpPollIfNeeded();
+static std::optional<Common::IPv4Port> ReverseAdjustIPv4PortFromConfig(Common::IPv4Port subject);
+static GuestSocket accept_(int fd, sockaddr* addr, socklen_t* len);
 
 static std::array<u8, 0x4ffe00> s_network_command_buffer;
 static std::array<u8, 0x80000> s_network_buffer;
@@ -470,16 +484,30 @@ static void TestHwPhase2Callback(Core::System& system, u64 userdata, s64 cycles_
 
 // At most one completion is delivered per firing: PPC reads s_exec2_last_response on each
 // interrupt, so back-to-back writes would shadow each other.
-static void AsyncConnectPollCallback(Core::System& system, u64 userdata, s64 cycles_late)
+static void AsyncOpPollCallback(Core::System& system, u64 userdata, s64 cycles_late)
 {
-  s_async_connect_poll_scheduled = false;
-  if (s_async_connects.empty())
+  s_async_op_poll_scheduled = false;
+  if (s_async_ops.empty())
     return;
 
   std::vector<WSAPOLLFD> pfds;
-  pfds.reserve(s_async_connects.size());
-  for (const auto& [host_socket, ctx] : s_async_connects)
-    pfds.push_back({.fd = host_socket, .events = POLLOUT});
+  pfds.reserve(s_async_ops.size());
+  for (const auto& [host_socket, ctx] : s_async_ops)
+  {
+    short events = 0;
+    switch (ctx.op_type)
+    {
+    case AsyncOpType::Connect:
+    case AsyncOpType::Send:
+      events = POLLOUT;
+      break;
+    case AsyncOpType::Recv:
+    case AsyncOpType::Accept:
+      events = POLLIN;
+      break;
+    }
+    pfds.push_back({.fd = host_socket, .events = events});
+  }
 
   PlatformPoll(pfds, std::chrono::milliseconds{0});
 
@@ -487,54 +515,230 @@ static void AsyncConnectPollCallback(Core::System& system, u64 userdata, s64 cyc
 
   for (const auto& pfd : pfds)
   {
-    const bool kernel_ready = (pfd.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0;
-
-    const auto it = s_async_connects.find(pfd.fd);
-    if (it == s_async_connects.end())
+    const auto it = s_async_ops.find(pfd.fd);
+    if (it == s_async_ops.end())
       continue;
+
+    short ready_mask = POLLERR | POLLHUP | POLLNVAL;
+    switch (it->second.op_type)
+    {
+    case AsyncOpType::Connect:
+    case AsyncOpType::Send:
+      ready_mask |= POLLOUT;
+      break;
+    case AsyncOpType::Recv:
+    case AsyncOpType::Accept:
+      ready_mask |= POLLIN;
+      break;
+    }
+    const bool kernel_ready = (pfd.revents & ready_mask) != 0;
 
     if (!kernel_ready && now < it->second.deadline)
       continue;
 
-    const AsyncConnect ctx = it->second;
-    s_async_connects.erase(it);
+    const AsyncOp ctx = it->second;
+    s_async_ops.erase(it);
 
-    int so_error = 0;
-    socklen_t optlen = sizeof(so_error);
-    getsockopt(ctx.host_socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &optlen);
-
-    // Mirror NetDIMMConnect's ScopeGuard: the socket goes back to blocking now that the
-    // connect has resolved (or timed out), matching what the synchronous path used to do.
-    u_long blocking = 0;
-    ioctlsocket(ctx.host_socket, FIONBIO, &blocking);
-
-    int connect_result;
-    if (kernel_ready && so_error == 0)
+    int op_result = SOCKET_ERROR;
+    switch (ctx.op_type)
     {
-      INFO_LOG_FMT(AMMEDIABOARD_NET, "AsyncConnect: socket {} succeeded", ctx.host_socket);
-      s_last_error = SSC_SUCCESS;
-      connect_result = 0;
-    }
-    else if (kernel_ready)
+    case AsyncOpType::Connect:
     {
-      WARN_LOG_FMT(AMMEDIABOARD, "AsyncConnect: socket {} failed: {}", ctx.host_socket,
-                   Common::DecodeNetworkError(so_error));
-      s_last_error = SOCKET_ERROR;
-      connect_result = SOCKET_ERROR;
+      int so_error = 0;
+      socklen_t optlen = sizeof(so_error);
+      getsockopt(ctx.host_socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error),
+                 &optlen);
+
+      // Mirror NetDIMMConnect's ScopeGuard: the socket goes back to blocking now that the
+      // connect has resolved (or timed out), matching what the synchronous path used to do.
+      u_long blocking = 0;
+      ioctlsocket(ctx.host_socket, FIONBIO, &blocking);
+
+      if (kernel_ready && so_error == 0)
+      {
+        INFO_LOG_FMT(AMMEDIABOARD_NET, "AsyncOp[Connect]: socket {} succeeded", ctx.host_socket);
+        s_last_error = SSC_SUCCESS;
+        op_result = 0;
+      }
+      else if (kernel_ready)
+      {
+        WARN_LOG_FMT(AMMEDIABOARD, "AsyncOp[Connect]: socket {} failed: {}", ctx.host_socket,
+                     Common::DecodeNetworkError(so_error));
+        s_last_error = SOCKET_ERROR;
+        op_result = SOCKET_ERROR;
+      }
+      else
+      {
+        s_last_error = SSC_EWOULDBLOCK;
+        op_result = SOCKET_ERROR;
+      }
+      break;
     }
-    else
+    case AsyncOpType::Recv:
     {
-      s_last_error = SSC_EWOULDBLOCK;
-      connect_result = SOCKET_ERROR;
+      const u32 off = ctx.saved_media_buffer[ctx.parameter_offset + 1];
+      u32 len = ctx.saved_media_buffer[ctx.parameter_offset + 2];
+
+      const auto data_span = GetSpanForMediaboardAddress(off);
+      if (data_span.size() < len)
+        len = 0;
+
+      if (kernel_ready)
+      {
+        op_result = recv(ctx.host_socket, reinterpret_cast<char*>(data_span.data()), len, 0);
+        const int err = WSAGetLastError();
+        if (op_result < 0)
+        {
+          WARN_LOG_FMT(AMMEDIABOARD_NET,
+                       "AsyncOp[Recv]: recv( {}, 0x{:08x}, {} ) failed: {} ({})", ctx.host_socket,
+                       off, len, err, Common::DecodeNetworkError(err));
+          s_last_error = SOCKET_ERROR;
+        }
+        else if (op_result == 0)
+        {
+          INFO_LOG_FMT(AMMEDIABOARD_NET,
+                       "AsyncOp[Recv]: recv( {}, 0x{:08x}, {} ):0 shutdown received",
+                       ctx.host_socket, off, len);
+          s_last_error = SSC_SUCCESS;
+        }
+        else
+        {
+          DEBUG_LOG_FMT(AMMEDIABOARD_NET, "AsyncOp[Recv]: recv( {}, 0x{:08x}, {} ):{}",
+                        ctx.host_socket, off, len, op_result);
+          s_last_error = SSC_SUCCESS;
+        }
+      }
+      else
+      {
+        // Deadline reached without data ready.
+        DEBUG_LOG_FMT(AMMEDIABOARD_NET, "AsyncOp[Recv]: socket {} timed out", ctx.host_socket);
+        s_last_error = SSC_ETIMEDOUT;
+        op_result = SOCKET_ERROR;
+      }
+
+      // Restore blocking mode for whatever the game does next on this socket.
+      u_long blocking = 0;
+      ioctlsocket(ctx.host_socket, FIONBIO, &blocking);
+      break;
+    }
+    case AsyncOpType::Send:
+    {
+      const u32 off = ctx.saved_media_buffer[ctx.parameter_offset + 1];
+      u32 len = ctx.saved_media_buffer[ctx.parameter_offset + 2];
+
+      const auto data_span = GetSpanForMediaboardAddress(off);
+      if (data_span.size() < len)
+        len = 0;
+
+      if (kernel_ready)
+      {
+        op_result =
+            send(ctx.host_socket, reinterpret_cast<char*>(data_span.data()), len, SEND_FLAGS);
+        const int err = WSAGetLastError();
+        if (op_result < 0)
+        {
+          WARN_LOG_FMT(AMMEDIABOARD_NET,
+                       "AsyncOp[Send]: send( {}, 0x{:08x}, {} ) failed: {} ({})", ctx.host_socket,
+                       off, len, err, Common::DecodeNetworkError(err));
+          s_last_error = SOCKET_ERROR;
+        }
+        else
+        {
+          DEBUG_LOG_FMT(AMMEDIABOARD_NET, "AsyncOp[Send]: send( {}, 0x{:08x}, {} ):{}",
+                        ctx.host_socket, off, len, op_result);
+          s_last_error = SSC_SUCCESS;
+        }
+      }
+      else
+      {
+        DEBUG_LOG_FMT(AMMEDIABOARD_NET, "AsyncOp[Send]: socket {} timed out", ctx.host_socket);
+        s_last_error = SSC_ETIMEDOUT;
+        op_result = SOCKET_ERROR;
+      }
+
+      u_long blocking = 0;
+      ioctlsocket(ctx.host_socket, FIONBIO, &blocking);
+      break;
+    }
+    case AsyncOpType::Accept:
+    {
+      const u32 addr_off = ctx.saved_media_buffer[ctx.parameter_offset + 1];
+      const u32 addrlen_off = ctx.saved_media_buffer[ctx.parameter_offset + 2];
+
+      const auto addrlen_span = GetSpanForMediaboardAddress(addrlen_off);
+      u8* addr_ptr = nullptr;
+      u8* addrlen_ptr = nullptr;
+      if (addrlen_span.size() >= sizeof(u32))
+      {
+        addrlen_ptr = addrlen_span.data();
+        const u32 addrlen = Common::BitCastPtr<u32>(addrlen_ptr);
+        const auto addr_span = GetSpanForMediaboardAddress(addr_off);
+        if (addr_span.size() >= addrlen)
+          addr_ptr = addr_span.data();
+      }
+
+      if (kernel_ready)
+      {
+        sockaddr_in addr;
+        socklen_t addrlen = sizeof(addr);
+        const auto client_sock =
+            accept_(ctx.host_socket, reinterpret_cast<sockaddr*>(&addr), &addrlen);
+
+        if (client_sock == INVALID_GUEST_SOCKET)
+        {
+          ERROR_LOG_FMT(AMMEDIABOARD, "AsyncOp[Accept]: accept( {} ) failed: {}", ctx.host_socket,
+                        Common::StrNetworkError());
+          s_last_error = SOCKET_ERROR;
+          op_result = u32(INVALID_GUEST_SOCKET);
+        }
+        else
+        {
+          NOTICE_LOG_FMT(AMMEDIABOARD, "AsyncOp[Accept]: {}:{}",
+                         Common::IPAddressToString(std::bit_cast<Common::IPAddress>(addr.sin_addr)),
+                         ntohs(addr.sin_port));
+          s_last_error = SSC_SUCCESS;
+          op_result = u32(client_sock);
+
+          if (addr_ptr != nullptr)
+          {
+            GuestSocketAddress guest_addr{
+                .ip_family = u8(addr.sin_family),
+                .port = addr.sin_port,
+                .ip_address = std::bit_cast<Common::IPAddress>(addr.sin_addr),
+            };
+
+            if (const auto adjusted = ReverseAdjustIPv4PortFromConfig(
+                    {guest_addr.ip_address, guest_addr.port}))
+            {
+              guest_addr.ip_address = adjusted->ip_address;
+              guest_addr.port = adjusted->port;
+            }
+
+            const u32 write_size =
+                std::min<u32>(Common::BitCastPtr<u32>(addrlen_ptr), sizeof(guest_addr));
+            std::memcpy(addr_ptr, &guest_addr, write_size);
+            *addrlen_ptr = sizeof(guest_addr);
+          }
+        }
+      }
+      else
+      {
+        s_last_error = SSC_EWOULDBLOCK;
+        op_result = u32(INVALID_GUEST_SOCKET);
+      }
+      // Accept does not toggle socket blocking mode: the listen socket stays in whatever
+      // mode it was in (WSAPoll on the listen socket suffices to know accept won't block).
+      break;
+    }
     }
 
-    // Replay what the synchronous AMMBCommandConnect + Execute2 dispatch would have done:
-    // rebuild the command frame in s_media_buffer, set the per-command result fields, mark
+    // Replay what the synchronous command + Execute2 dispatch would have done: rebuild the
+    // command frame in s_media_buffer, set the per-command result fields, mark
     // command-complete, snapshot into s_exec2_last_response, fire the Execute2 interrupt.
     std::memcpy(s_media_buffer_32.data(), ctx.saved_media_buffer.data(),
                 sizeof(s_media_buffer_32));
     s_media_buffer[1] = s_media_buffer[8];
-    s_media_buffer_32[1] = static_cast<u32>(connect_result);
+    s_media_buffer_32[1] = static_cast<u32>(op_result);
     s_media_buffer[3] |= 0x80;
     std::memcpy(s_exec2_last_response.data(), s_media_buffer_32.data(),
                 sizeof(s_exec2_last_response));
@@ -543,22 +747,22 @@ static void AsyncConnectPollCallback(Core::System& system, u64 userdata, s64 cyc
     break;
   }
 
-  if (!s_async_connects.empty())
-    ScheduleAsyncConnectPollIfNeeded();
+  if (!s_async_ops.empty())
+    ScheduleAsyncOpPollIfNeeded();
 }
 
-static void ScheduleAsyncConnectPollIfNeeded()
+static void ScheduleAsyncOpPollIfNeeded()
 {
-  if (s_async_connects.empty() || s_et_async_connect_poll == nullptr)
+  if (s_async_ops.empty() || s_et_async_op_poll == nullptr)
     return;
-  if (s_async_connect_poll_scheduled)
+  if (s_async_op_poll_scheduled)
     return;
 
   auto& system = Core::System::GetInstance();
   const s64 cycles =
-      system.GetSystemTimers().GetTicksPerSecond() / 1'000'000 * kAsyncConnectPollIntervalUs;
-  system.GetCoreTiming().ScheduleEvent(cycles, s_et_async_connect_poll, 0);
-  s_async_connect_poll_scheduled = true;
+      system.GetSystemTimers().GetTicksPerSecond() / 1'000'000 * kAsyncOpPollIntervalUs;
+  system.GetCoreTiming().ScheduleEvent(cycles, s_et_async_op_poll, 0);
+  s_async_op_poll_scheduled = true;
 }
 
 void Init()
@@ -578,11 +782,11 @@ void Init()
 
   auto& core_timing = Core::System::GetInstance().GetCoreTiming();
   s_et_test_hw_phase2 = core_timing.RegisterEvent("AMMediaboardTestHwPhase2", TestHwPhase2Callback);
-  s_et_async_connect_poll =
-      core_timing.RegisterEvent("AMMediaboardAsyncConnectPoll", AsyncConnectPollCallback);
-  s_async_connects.clear();
-  s_connect_deferred = false;
-  s_async_connect_poll_scheduled = false;
+  s_et_async_op_poll =
+      core_timing.RegisterEvent("AMMediaboardAsyncOpPoll", AsyncOpPollCallback);
+  s_async_ops.clear();
+  s_async_defer_active = false;
+  s_async_op_poll_scheduled = false;
 
   s_board_status = LoadingGameProgram;
   s_load_progress = 80;
@@ -888,26 +1092,28 @@ static s32 NetDIMMConnect(GuestSocket guest_socket, const GuestSocketAddress& gu
     return SOCKET_ERROR;
   }
 
-  // Defer completion: keep the socket non-blocking and let AsyncConnectPollCallback handle
-  // it. The dismiss prevents the ScopeGuard above from flipping back to blocking while the
-  // connect is still in flight; the callback restores blocking once it resolves.
+  // Defer completion: keep the socket non-blocking and let AsyncOpPollCallback handle it. The
+  // dismiss prevents the ScopeGuard above from flipping back to blocking while the connect is
+  // still in flight; the callback restores blocking once it resolves.
   guard.Dismiss();
 
-  AsyncConnect ctx{};
+  AsyncOp ctx{};
+  ctx.op_type = AsyncOpType::Connect;
   ctx.host_socket = host_socket;
+  ctx.parameter_offset = 0;  // Unused by Connect: callback rebuilds the response from byte[8].
   std::memcpy(ctx.saved_media_buffer.data(), s_media_buffer_32.data(),
               sizeof(ctx.saved_media_buffer));
   ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{s_timeouts[0]};
-  s_async_connects[host_socket] = ctx;
-  s_connect_deferred = true;
-  ScheduleAsyncConnectPollIfNeeded();
+  s_async_ops[host_socket] = ctx;
+  s_async_defer_active = true;
+  ScheduleAsyncOpPollIfNeeded();
 
   s_last_error = SSC_EWOULDBLOCK;
   return SOCKET_ERROR;
 }
 
 static GuestSocket NetDIMMAccept(GuestSocket guest_socket, u8* guest_addr_ptr,
-                                 u8* guest_addrlen_ptr)
+                                 u8* guest_addrlen_ptr, u32 parameter_offset)
 {
   // Either both parameters should be provided, or neither.
   if ((guest_addr_ptr != nullptr) != (guest_addrlen_ptr != nullptr))
@@ -922,7 +1128,9 @@ static GuestSocket NetDIMMAccept(GuestSocket guest_socket, u8* guest_addr_ptr,
   const auto host_socket = GetHostSocket(guest_socket);
   WSAPOLLFD pfds[1]{{.fd = host_socket, .events = POLLIN}};
 
-  // FYI: Currently using a 0ms timeout to make accept calls always non-blocking.
+  // Probe with a 0ms timeout. If something is already waiting we accept synchronously; if
+  // not, defer to AsyncOpPollCallback so the result is delivered through the same
+  // acPollResponse/acReadResponse path the game uses for other async ops.
   constexpr auto timeout = std::chrono::milliseconds{0};
 
   DEBUG_LOG_FMT(AMMEDIABOARD, "NetDIMMAccept: {}({})", host_socket, int(guest_socket));
@@ -940,8 +1148,26 @@ static GuestSocket NetDIMMAccept(GuestSocket guest_socket, u8* guest_addr_ptr,
 
   if ((pfds[0].revents & POLLIN) == 0)
   {
-    // Timeout.
-    DEBUG_LOG_FMT(AMMEDIABOARD, "NetDIMMAccept: Timeout.");
+    // No incoming connection right now: defer until one arrives or the deadline elapses.
+    if (s_async_ops.contains(host_socket))
+    {
+      DEBUG_LOG_FMT(AMMEDIABOARD,
+                    "NetDIMMAccept: async op already pending on socket {}, returning EWOULDBLOCK",
+                    host_socket);
+      s_last_error = SSC_EWOULDBLOCK;
+      return INVALID_GUEST_SOCKET;
+    }
+
+    AsyncOp ctx{};
+    ctx.op_type = AsyncOpType::Accept;
+    ctx.host_socket = host_socket;
+    ctx.parameter_offset = parameter_offset;
+    std::memcpy(ctx.saved_media_buffer.data(), s_media_buffer_32.data(),
+                sizeof(ctx.saved_media_buffer));
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{s_timeouts[0]};
+    s_async_ops[host_socket] = ctx;
+    s_async_defer_active = true;
+    ScheduleAsyncOpPollIfNeeded();
 
     s_last_error = SSC_EWOULDBLOCK;
     return INVALID_GUEST_SOCKET;
@@ -1071,28 +1297,70 @@ static void AMMBCommandRecv(u32 parameter_offset)
     len = 0;
   }
 
-  // TODO: Might be blocking depending on the timeout (see SetTimeouts command).
+  // Try a non-blocking recv first; if no data is ready, defer to AsyncOpPollCallback rather
+  // than block the CPU thread until SO_RCVTIMEO (which the game may set to 80s).
+  u_long nonblocking = 1;
+  ioctlsocket(fd, FIONBIO, &nonblocking);
+  Common::ScopeGuard restore_blocking{[&] {
+    u_long blocking = 0;
+    ioctlsocket(fd, FIONBIO, &blocking);
+  }};
+
   const int ret = recv(fd, reinterpret_cast<char*>(data_span.data()), len, 0);
   const int err = WSAGetLastError();
 
-  if (ret < 0 && err != WSAEWOULDBLOCK)
+  if (ret >= 0 || err != WSAEWOULDBLOCK)
   {
-    ERROR_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ) failed with error {}: {}", fd,
-                  off, len, err, Common::DecodeNetworkError(err));
-  }
-  else if (ret == 0)
-  {
-    INFO_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ):0 shutdown received", fd, off,
-                 len);
-  }
-  else
-  {
-    DEBUG_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ):{} {}", fd, off, len, ret,
-                  err);
+    if (ret < 0)
+    {
+      ERROR_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ) failed with error {}: {}",
+                    fd, off, len, err, Common::DecodeNetworkError(err));
+      s_last_error = SOCKET_ERROR;
+    }
+    else if (ret == 0)
+    {
+      INFO_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ):0 shutdown received", fd, off,
+                   len);
+      s_last_error = SSC_SUCCESS;
+    }
+    else
+    {
+      DEBUG_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: recv( {}, 0x{:08x}, {} ):{} {}", fd, off, len, ret,
+                    err);
+      s_last_error = SSC_SUCCESS;
+    }
+
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = ret;
+    return;
   }
 
-  s_media_buffer[1] = s_media_buffer[8];
-  s_media_buffer_32[1] = ret;
+  // EWOULDBLOCK: defer completion to AsyncOpPollCallback. Keep the socket non-blocking; the
+  // callback will restore blocking once recv resolves.
+  if (s_async_ops.contains(fd))
+  {
+    WARN_LOG_FMT(AMMEDIABOARD,
+                 "AMMBCommandRecv: async op already pending on socket {}, refusing overlap", fd);
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
+    s_last_error = SOCKET_ERROR;
+    return;
+  }
+
+  restore_blocking.Dismiss();
+
+  AsyncOp ctx{};
+  ctx.op_type = AsyncOpType::Recv;
+  ctx.host_socket = fd;
+  ctx.parameter_offset = parameter_offset;
+  std::memcpy(ctx.saved_media_buffer.data(), s_media_buffer_32.data(),
+              sizeof(ctx.saved_media_buffer));
+  ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{s_timeouts[2]};
+  s_async_ops[fd] = ctx;
+  s_async_defer_active = true;
+  ScheduleAsyncOpPollIfNeeded();
+
+  s_last_error = SSC_EWOULDBLOCK;
 }
 
 static void AMMBCommandSend(u32 parameter_offset)
@@ -1110,23 +1378,64 @@ static void AMMBCommandSend(u32 parameter_offset)
     len = 0;
   }
 
-  // TODO: Might be blocking depending on the timeout (see SetTimeouts command).
+  // Try a non-blocking send first; if the kernel buffer is full, defer to AsyncOpPollCallback
+  // rather than block the CPU thread until SO_SNDTIMEO (which the game may set to 80s).
+  u_long nonblocking = 1;
+  ioctlsocket(fd, FIONBIO, &nonblocking);
+  Common::ScopeGuard restore_blocking{[&] {
+    u_long blocking = 0;
+    ioctlsocket(fd, FIONBIO, &blocking);
+  }};
+
   const int ret = send(fd, reinterpret_cast<char*>(data_span.data()), len, SEND_FLAGS);
   const int err = WSAGetLastError();
 
-  if (ret < 0 && err != WSAEWOULDBLOCK)
+  if (ret >= 0 || err != WSAEWOULDBLOCK)
   {
-    ERROR_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: send( {}({}), 0x{:08x}, {} ) failed with error {}: {}",
-                  fd, u32(guest_socket), off, len, err, Common::DecodeNetworkError(err));
-  }
-  else
-  {
-    DEBUG_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: send( {}({}), 0x{:08x}, {} ): {} {}", fd,
-                  u32(guest_socket), off, len, ret, err);
+    if (ret < 0)
+    {
+      ERROR_LOG_FMT(AMMEDIABOARD_NET,
+                    "GC-AM: send( {}({}), 0x{:08x}, {} ) failed with error {}: {}", fd,
+                    u32(guest_socket), off, len, err, Common::DecodeNetworkError(err));
+      s_last_error = SOCKET_ERROR;
+    }
+    else
+    {
+      DEBUG_LOG_FMT(AMMEDIABOARD_NET, "GC-AM: send( {}({}), 0x{:08x}, {} ): {} {}", fd,
+                    u32(guest_socket), off, len, ret, err);
+      s_last_error = SSC_SUCCESS;
+    }
+
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = ret;
+    return;
   }
 
-  s_media_buffer[1] = s_media_buffer[8];
-  s_media_buffer_32[1] = ret;
+  // EWOULDBLOCK: defer.
+  if (s_async_ops.contains(fd))
+  {
+    WARN_LOG_FMT(AMMEDIABOARD,
+                 "AMMBCommandSend: async op already pending on socket {}, refusing overlap", fd);
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
+    s_last_error = SOCKET_ERROR;
+    return;
+  }
+
+  restore_blocking.Dismiss();
+
+  AsyncOp ctx{};
+  ctx.op_type = AsyncOpType::Send;
+  ctx.host_socket = fd;
+  ctx.parameter_offset = parameter_offset;
+  std::memcpy(ctx.saved_media_buffer.data(), s_media_buffer_32.data(),
+              sizeof(ctx.saved_media_buffer));
+  ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{s_timeouts[1]};
+  s_async_ops[fd] = ctx;
+  s_async_defer_active = true;
+  ScheduleAsyncOpPollIfNeeded();
+
+  s_last_error = SSC_EWOULDBLOCK;
 }
 
 static void AMMBCommandSocket(u32 parameter_offset)
@@ -1217,7 +1526,7 @@ static void AMMBCommandAccept(u32 parameter_offset)
     }
   }
 
-  const auto accept_result = NetDIMMAccept(guest_socket, addr_ptr, addrlen_ptr);
+  const auto accept_result = NetDIMMAccept(guest_socket, addr_ptr, addrlen_ptr, parameter_offset);
 
   s_media_buffer_32[1] = u32(accept_result);
 }
@@ -1904,11 +2213,11 @@ u32 ExecuteCommand(std::array<u32, 3>& dicmd_buf, u32* diimm_buf, u32 address, u
         break;
       }
 
-      // Connect deferred its completion to AsyncConnectPollCallback; skip the synchronous
+      // The command deferred its completion to AsyncOpPollCallback; skip the synchronous
       // response-save + interrupt here.
-      if (s_connect_deferred)
+      if (s_async_defer_active)
       {
-        s_connect_deferred = false;
+        s_async_defer_active = false;
         memory.Memset(address, 0, length);
         return 0;
       }
@@ -2427,9 +2736,9 @@ bool GetTestMenu()
 static void CloseAllSockets()
 {
   // Sockets are closed below, so async map entries must drop first to avoid dangling fds.
-  s_async_connects.clear();
-  s_connect_deferred = false;
-  s_async_connect_poll_scheduled = false;
+  s_async_ops.clear();
+  s_async_defer_active = false;
+  s_async_op_poll_scheduled = false;
 
   for (u32 i = FIRST_VALID_FD; i < std::size(s_sockets); ++i)
   {
