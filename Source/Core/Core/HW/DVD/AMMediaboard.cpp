@@ -725,6 +725,10 @@ static void AsyncOpPollCallback(Core::System& system, u64 userdata, s64 cycles_l
             {
               guest_addr.ip_address = adjusted->ip_address;
               guest_addr.port = adjusted->port;
+
+              NOTICE_LOG_FMT(AMMEDIABOARD, "AsyncOp[Accept]: Translating result to: {}:{}",
+                             Common::IPAddressToString(guest_addr.ip_address),
+                             ntohs(guest_addr.port));
             }
 
             const u32 write_size =
@@ -1109,6 +1113,16 @@ static NetDIMMConnectResult NetDIMMConnect(GuestSocket guest_socket,
   }
 
   // EWOULDBLOCK: defer to AsyncOpPollCallback. The socket stays non-blocking (it always is).
+  // Reject overlapping connects on the same socket so we don't lose the previous saved frame.
+  if (s_async_ops.contains(host_socket))
+  {
+    WARN_LOG_FMT(AMMEDIABOARD,
+                 "NetDIMMConnect: async op already pending on socket {}, refusing overlap",
+                 host_socket);
+    s_last_error = SSC_EWOULDBLOCK;
+    return {SOCKET_ERROR, false};
+  }
+
   AsyncOp ctx{};
   ctx.op_type = AsyncOpType::Connect;
   ctx.context = context;
@@ -1145,6 +1159,18 @@ static NetDIMMAcceptResult NetDIMMAccept(GuestSocket guest_socket, u8* guest_add
   }
 
   const auto host_socket = GetHostSocket(guest_socket);
+
+  // An async op is already in flight on this listen socket; reject before touching anything
+  // else (skips an otherwise wasted WSAPoll round trip).
+  if (s_async_ops.contains(host_socket))
+  {
+    DEBUG_LOG_FMT(AMMEDIABOARD,
+                  "NetDIMMAccept: async op already pending on socket {}, returning EWOULDBLOCK",
+                  host_socket);
+    s_last_error = SSC_EWOULDBLOCK;
+    return {INVALID_GUEST_SOCKET, false};
+  }
+
   WSAPOLLFD pfds[1]{{.fd = host_socket, .events = POLLIN}};
 
   // Probe with a 0ms timeout. If something is already waiting we accept synchronously; if
@@ -1168,15 +1194,6 @@ static NetDIMMAcceptResult NetDIMMAccept(GuestSocket guest_socket, u8* guest_add
   if ((pfds[0].revents & POLLIN) == 0)
   {
     // No incoming connection right now: defer until one arrives or the deadline elapses.
-    if (s_async_ops.contains(host_socket))
-    {
-      DEBUG_LOG_FMT(AMMEDIABOARD,
-                    "NetDIMMAccept: async op already pending on socket {}, returning EWOULDBLOCK",
-                    host_socket);
-      s_last_error = SSC_EWOULDBLOCK;
-      return {INVALID_GUEST_SOCKET, false};
-    }
-
     AsyncOp ctx{};
     ctx.op_type = AsyncOpType::Accept;
     ctx.context = context;
@@ -2772,6 +2789,8 @@ static void CloseAllSockets()
 {
   // Sockets are closed below, so async map entries must drop first to avoid dangling fds.
   s_async_ops.clear();
+  if (s_et_async_op_poll != nullptr)
+    Core::System::GetInstance().GetCoreTiming().RemoveEvent(s_et_async_op_poll);
   s_async_op_poll_scheduled = false;
 
   for (u32 i = FIRST_VALID_FD; i < std::size(s_sockets); ++i)
