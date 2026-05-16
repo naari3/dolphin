@@ -203,7 +203,6 @@ static int PlatformPoll(std::span<WSAPOLLFD> pfds, std::chrono::milliseconds tim
 static void AsyncOpPollCallback(Core::System& system, u64 userdata, s64 cycles_late);
 static void ScheduleAsyncOpPollIfNeeded();
 static std::optional<Common::IPv4Port> ReverseAdjustIPv4PortFromConfig(Common::IPv4Port subject);
-static GuestSocket accept_(int fd, sockaddr* addr, socklen_t* len);
 
 static std::array<u8, 0x4ffe00> s_network_command_buffer;
 static std::array<u8, 0x80000> s_network_buffer;
@@ -723,6 +722,8 @@ static void AsyncOpPollCallback(Core::System& system, u64 userdata, s64 cycles_l
       }
       else
       {
+        // Deadline reached without an incoming connection.
+        DEBUG_LOG_FMT(AMMEDIABOARD, "AsyncOp[Accept]: socket {} timed out", ctx.host_socket);
         s_last_error = SSC_EWOULDBLOCK;
         op_result = u32(INVALID_GUEST_SOCKET);
       }
@@ -1297,6 +1298,19 @@ static void AMMBCommandRecv(u32 parameter_offset)
     len = 0;
   }
 
+  // Don't toggle socket modes if a previous async op is still in flight on this fd: the
+  // callback is the owner of the non-blocking state, so we must not flip it back to blocking
+  // from under it.
+  if (s_async_ops.contains(fd))
+  {
+    WARN_LOG_FMT(AMMEDIABOARD,
+                 "AMMBCommandRecv: async op already pending on socket {}, refusing overlap", fd);
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
+    s_last_error = SSC_EWOULDBLOCK;
+    return;
+  }
+
   // Try a non-blocking recv first; if no data is ready, defer to AsyncOpPollCallback rather
   // than block the CPU thread until SO_RCVTIMEO (which the game may set to 80s).
   u_long nonblocking = 1;
@@ -1337,16 +1351,6 @@ static void AMMBCommandRecv(u32 parameter_offset)
 
   // EWOULDBLOCK: defer completion to AsyncOpPollCallback. Keep the socket non-blocking; the
   // callback will restore blocking once recv resolves.
-  if (s_async_ops.contains(fd))
-  {
-    WARN_LOG_FMT(AMMEDIABOARD,
-                 "AMMBCommandRecv: async op already pending on socket {}, refusing overlap", fd);
-    s_media_buffer[1] = s_media_buffer[8];
-    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
-    s_last_error = SOCKET_ERROR;
-    return;
-  }
-
   restore_blocking.Dismiss();
 
   AsyncOp ctx{};
@@ -1376,6 +1380,19 @@ static void AMMBCommandSend(u32 parameter_offset)
     ERROR_LOG_FMT(AMMEDIABOARD_NET, "AMMBCommandSend: Bad data offset or length: off={:08x} len={}",
                   off, len);
     len = 0;
+  }
+
+  // Don't toggle socket modes if a previous async op is still in flight on this fd: the
+  // callback is the owner of the non-blocking state, so we must not flip it back to blocking
+  // from under it.
+  if (s_async_ops.contains(fd))
+  {
+    WARN_LOG_FMT(AMMEDIABOARD,
+                 "AMMBCommandSend: async op already pending on socket {}, refusing overlap", fd);
+    s_media_buffer[1] = s_media_buffer[8];
+    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
+    s_last_error = SSC_EWOULDBLOCK;
+    return;
   }
 
   // Try a non-blocking send first; if the kernel buffer is full, defer to AsyncOpPollCallback
@@ -1412,16 +1429,6 @@ static void AMMBCommandSend(u32 parameter_offset)
   }
 
   // EWOULDBLOCK: defer.
-  if (s_async_ops.contains(fd))
-  {
-    WARN_LOG_FMT(AMMEDIABOARD,
-                 "AMMBCommandSend: async op already pending on socket {}, refusing overlap", fd);
-    s_media_buffer[1] = s_media_buffer[8];
-    s_media_buffer_32[1] = static_cast<u32>(SOCKET_ERROR);
-    s_last_error = SOCKET_ERROR;
-    return;
-  }
-
   restore_blocking.Dismiss();
 
   AsyncOp ctx{};
@@ -1456,6 +1463,15 @@ static void AMMBCommandClosesocket(u32 parameter_offset)
 {
   const auto guest_socket = GuestSocket(s_media_buffer_32[parameter_offset]);
   const auto fd = GetHostSocket(guest_socket);
+
+  // Drop any pending async op for this fd before closing: otherwise the OS may reuse the same
+  // fd for a new socket and the stale entry would steer the poll callback to fire an unrelated
+  // response.
+  if (s_async_ops.erase(fd) > 0)
+  {
+    INFO_LOG_FMT(AMMEDIABOARD_NET,
+                 "AMMBCommandClosesocket: dropped pending async op on socket {}", fd);
+  }
 
   const int ret = closesocket(fd);
 
